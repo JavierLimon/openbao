@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	log "github.com/hashicorp/go-hclog"
 	uuid "github.com/hashicorp/go-uuid"
@@ -99,6 +100,9 @@ func newDispatcher(name string, numWorkers int, l log.Logger) *dispatcher {
 	return d
 }
 
+// dispatchTimeout is the maximum time to wait for init to be confirmed
+const dispatchTimeout = 1 * time.Second
+
 // dispatch dispatches a job to the worker pool, with optional initialization
 // and cleanup functions (useful for tracking job progress)
 func (d *dispatcher) dispatch(job Job, init initFn, cleanup cleanupFn) {
@@ -111,10 +115,27 @@ func (d *dispatcher) dispatch(job Job, init initFn, cleanup cleanupFn) {
 
 	select {
 	case d.jobCh <- wJob:
-		// Wait for worker to confirm init was called before returning
-		<-wJob.initDone
+		// Job sent - wait for init confirmation or timeout
+		select {
+		case <-wJob.initDone:
+			// Normal path - init was confirmed
+			return
+		case <-d.quit:
+			// Shutdown in progress - cleanup as best effort since init may have been called
+			if cleanup != nil {
+				cleanup()
+			}
+			return
+		case <-time.After(dispatchTimeout):
+			// Timeout - assume worker died, cleanup as best effort
+			d.logger.Trace("dispatch timeout - calling cleanup as best effort")
+			if cleanup != nil {
+				cleanup()
+			}
+			return
+		}
 	case <-d.quit:
-		// Job was not dispatched - init was never called, so cleanup should not be called either
+		// Job was not dispatched - init was never called, so cleanup should not be called
 		return
 	}
 }
